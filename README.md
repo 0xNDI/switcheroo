@@ -65,6 +65,7 @@ tail -f /dev/null | sudo switcheroo ... &
 | `-rbcd-sid SID` | write an RBCD descriptor granting this SID |
 | `-value` / `-value-hex` / `-attribute` | write an arbitrary attribute instead of RBCD |
 | `-ntlmrelayx PATH` | optional: run a specific `ntlmrelayx.py` instead of the installed one |
+| `-use-kerberos` / `-k` | Kerberos for the attacker's signed LDAP connections (TGT from password/hashes) instead of NTLM; the relayed victim auth is unaffected |
 | `-hashes`, `-no-pass`, `-debug`, `-ts` | auth / logging |
 
 The tool prints the DC's `Bind`/`Modify` result codes and does an independent signed
