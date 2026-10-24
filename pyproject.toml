@@ -1,0 +1,22 @@
+[project]
+name = "switcheroo"
+version = "0.1.0"
+description = "Relay a coerced victim's NTLM authentication into an LDAP operation, bypassing LDAP signing"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    # LDAP signing + SASL context APIs (fortra/impacket PRs #1919/#1959) are only on
+    # master; the PyPI 0.13.1 release is not sufficient. Tracks latest master; the
+    # lockfile pins the resolved commit, bump with `uv lock --upgrade`.
+    "impacket @ git+https://github.com/fortra/impacket",
+]
+
+[project.scripts]
+switcheroo = "switcheroo:main"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
