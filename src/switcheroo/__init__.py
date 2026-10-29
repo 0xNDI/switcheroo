@@ -74,10 +74,11 @@ def build_parser():
 def resolve_ntlmrelayx(explicit=None):
     candidates = (
         explicit,
+        # the script runs under this interpreter, so it must come from this venv; a
+        # PATH ntlmrelayx.py belongs to another impacket install and mismatches
+        os.path.join(sysconfig.get_path("scripts"), "ntlmrelayx.py"),
         shutil.which("ntlmrelayx.py"),
         shutil.which("ntlmrelayx"),
-        # the pinned impacket dependency ships ntlmrelayx.py into this venv's bin dir
-        os.path.join(sysconfig.get_path("scripts"), "ntlmrelayx.py"),
     )
     for candidate in candidates:
         if candidate and os.path.isfile(candidate):
