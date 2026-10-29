@@ -19,7 +19,7 @@ uv tool install .
 Run without installing, from the repo:
 
 ```
-uv run switcheroo ...
+uv run switcheroo git+https://github.com/0xNDI/switcheroo
 ```
 
 To pick up newer master, `uv lock --upgrade && uv tool install --force --reinstall .`.
