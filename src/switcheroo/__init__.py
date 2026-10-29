@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 import argparse
+import importlib.metadata
 import os
 import random
 import runpy
-import shutil
 import struct
 import sys
-import sysconfig
 import time
 from struct import unpack
 
@@ -82,20 +81,33 @@ def build_parser():
     return parser
 
 
+def installed_ntlmrelayx():
+    """ntlmrelayx.py belonging to the impacket install this interpreter imports.
+
+    The script is run with runpy in this process, so it has to come from the same
+    install as the impacket package -- anything else is a version mismatch.
+    """
+    try:
+        dist = importlib.metadata.distribution("impacket")
+        scripts = [f for f in (dist.files or []) if str(f).endswith("bin/ntlmrelayx.py")]
+        if scripts:
+            return os.path.abspath(dist.locate_file(scripts[0]))
+    except importlib.metadata.PackageNotFoundError:
+        pass
+    return os.path.join(os.path.dirname(sys.executable), "ntlmrelayx.py")
+
+
 def resolve_ntlmrelayx(explicit=None):
-    candidates = (
-        explicit,
-        # the script runs under this interpreter, so it must come from this venv; a
-        # PATH ntlmrelayx.py belongs to another impacket install and mismatches
-        os.path.join(sysconfig.get_path("scripts"), "ntlmrelayx.py"),
-        shutil.which("ntlmrelayx.py"),
-        shutil.which("ntlmrelayx"),
-    )
-    for candidate in candidates:
-        if candidate and os.path.isfile(candidate):
-            return os.path.abspath(candidate)
-    raise SystemExit("ntlmrelayx.py not found; reinstall the project (uv tool install --force .) "
-                     "or pass -ntlmrelayx /path/to/ntlmrelayx.py")
+    installed = installed_ntlmrelayx()
+    if explicit:
+        if os.path.dirname(os.path.abspath(explicit)) != os.path.dirname(installed):
+            print(f"[!] {explicit} is not the ntlmrelayx.py of this environment "
+                  f"({installed}); an ImportError means version skew", flush=True)
+        return os.path.abspath(explicit)
+    if not os.path.isfile(installed):
+        raise SystemExit(f"[-] {installed} is missing; reinstall the project "
+                         f"(uv tool install --force -e .)")
+    return installed
 
 
 def signed_ldap_bind(conn):
@@ -469,7 +481,11 @@ def main():
         sys.argv.append("-debug")
     if args.ts:
         sys.argv.append("-ts")
-    runpy.run_path(resolve_ntlmrelayx(args.ntlmrelayx), run_name="__main__")
+    script = resolve_ntlmrelayx(args.ntlmrelayx)
+    try:
+        runpy.run_path(script, run_name="__main__")
+    except ImportError as error:
+        raise SystemExit(f"[-] {script} does not match the impacket installed here: {error}")
 
 
 if __name__ == "__main__":

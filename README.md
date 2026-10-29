@@ -90,7 +90,7 @@ tail -f /dev/null | sudo switcheroo ... &
 | `-modify-dn DN` / `-modify-sam ACCOUNT` | object to modify as the victim, by DN or by sAMAccountName (default: the victim's own account) |
 | `-rbcd ACCOUNT\|SID` | write an RBCD descriptor granting this account (sAMAccountName, SID resolved via LDAP) or raw SID |
 | `-value` / `-value-hex` / `-attribute` | write an arbitrary attribute instead of RBCD |
-| `-ntlmrelayx PATH` | optional: run a specific `ntlmrelayx.py` instead of the installed one |
+| `-ntlmrelayx PATH` | optional: run a specific `ntlmrelayx.py` instead of the one shipped with the installed Impacket (it runs in-process, so it must come from the same environment) |
 | `-use-kerberos` / `-k` | Kerberos for the attacker's signed LDAP connections (TGT from password/hashes) instead of NTLM; the relayed victim auth is unaffected |
 | `-hashes`, `-no-pass`, `-debug`, `-ts` | auth / logging |
 
